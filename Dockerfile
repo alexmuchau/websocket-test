@@ -22,7 +22,7 @@ RUN chown -R nodejs:nodejs /app
 USER nodejs
 
 # Expose the port that the app runs on
-EXPOSE 3000
+EXPOSE 3333
 
 # Define the command to run the application
 CMD ["node", "src/server.js"]
