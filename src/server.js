@@ -1,185 +1,143 @@
-// Importa os módulos necessários
 const express = require('express');
 const http = require('http');
-const { Server } = require('socket.io');
+const { WebSocketServer } = require('ws'); // Importa o servidor WebSocket nativo
+const url = require('url');
 
-// Inicializa o aplicativo Express
 const app = express();
-// Cria um servidor HTTP a partir do aplicativo Express
 const server = http.createServer(app);
-// Inicializa o Socket.IO para o servidor HTTP, permitindo CORS para qualquer origem
-const io = new Server(server, {
-  cors: {
-    origin: "*", // Permite conexões de qualquer origem (para desenvolvimento)
-    methods: ["GET", "POST"] // Métodos HTTP permitidos
-  }
-});
+const wss = new WebSocketServer({ server }); // Anexa o WebSocket Server ao servidor HTTP
 
-// Array para simular um banco de dados de reservas em memória
-// Em um ambiente de produção, isso seria substituído por um banco de dados real (MongoDB, PostgreSQL, etc.)
+// === ARMAZENAMENTO EM MEMÓRIA ===
 let reservations = [];
+// Usamos um Map para associar cada conexão WebSocket (ws) aos dados do usuário
+let clients = new Map(); 
 
-// Função para gerar um ID único para cada reserva
-const generateUniqueId = () => {
-  return Math.random().toString(36).substring(2, 15) + Math.random().toString(36).substring(2, 15);
+// === FUNÇÕES AUXILIARES ===
+
+const generateUniqueId = () => Date.now().toString(36) + Math.random().toString(36).substring(2);
+
+// Função para enviar uma mensagem para todos os clientes conectados
+const broadcast = (data) => {
+  const message = JSON.stringify(data);
+  wss.clients.forEach((client) => {
+    if (client.readyState === 1) { // 1 significa WebSocket.OPEN
+      client.send(message);
+    }
+  });
 };
 
-// Função para emitir o estado atual das reservas para todos os clientes
-const emitReservationsUpdate = () => {
-  // Filtra reservas expiradas antes de emitir para garantir que o cliente veja o estado mais recente
-  // Embora o monitor de expiração faça isso, é uma boa prática garantir a consistência
-  reservations = reservations.filter(res => {
-    if (res.status === 'reserved' && new Date() > new Date(res.expires_at)) {
-      console.log(`Reserva do número ${res.number} para ${res.user_email} expirou e foi removida.`);
-      return false; // Remove a reserva expirada
-    }
-    return true;
+const emitOnlineUsersUpdate = () => {
+  const uniqueUserEmails = [...new Set(Array.from(clients.values()).map(user => user.email))];
+  broadcast({
+    type: 'ONLINE_USERS_UPDATED',
+    payload: uniqueUserEmails
   });
+  console.log('Lista de usuários online emitida:', uniqueUserEmails);
+};
 
-  // Emite o evento RESERVATIONS_UPDATED para todos os clientes conectados
-  io.emit('RESERVATIONS_UPDATED', {
+const emitReservationsUpdate = () => {
+  broadcast({
     type: 'RESERVATIONS_UPDATED',
-    payload: reservations.map(res => ({
-      id: res.id,
-      number: res.number,
-      user_name: res.user_name,
-      user_email: res.user_email,
-      status: res.status,
-      reserved_at: res.reserved_at,
-      ...(res.status === 'reserved' && { expires_at: res.expires_at }), // Adiciona expires_at se status for 'reserved'
-      ...(res.status === 'purchased' && { purchased_at: res.purchased_at }) // Adiciona purchased_at se status for 'purchased'
-    }))
+    payload: reservations
   });
   console.log('Estado das reservas atualizado e emitido:', reservations.length);
 };
 
-// Monitor de expiração de reservas
-// Roda a cada 5 segundos para verificar e remover reservas expiradas
+// === LÓGICA DE NEGÓCIO (permanece a mesma) ===
 setInterval(() => {
   const now = new Date();
-  let changed = false;
+  const initialCount = reservations.length;
   reservations = reservations.filter(res => {
     if (res.status === 'reserved' && new Date(res.expires_at) <= now) {
-      console.log(`Reserva do número ${res.number} para ${res.user_email} expirou.`);
-      changed = true;
-      return false; // Remove a reserva expirada
+      console.log(`Reserva do número ${res.number} expirou.`);
+      return false;
     }
     return true;
   });
-
-  // Se alguma reserva foi removida, emite a atualização para todos os clientes
-  if (changed) {
+  if (reservations.length < initialCount) {
     emitReservationsUpdate();
   }
-}, 5000); // Verifica a cada 5 segundos
+}, 5000);
 
-// Lida com novas conexões WebSocket
-io.on('connection', (socket) => {
-  console.log(`Cliente conectado: ${socket.id}`);
+// === GERENCIAMENTO DE CONEXÕES WEBSOCKET ===
+
+wss.on('connection', (ws, req) => {
+  // Extrai parâmetros da URL de conexão (ex: ws://.../?user_email=a@b.com&user_name=Teste)
+  const parameters = new URL(req.url, `http://${req.headers.host}`).searchParams;
+  const user_email = parameters.get('user_email');
+  const user_name = parameters.get('user_name');
+  
+  console.log(`Cliente conectado: ${user_name} (${user_email})`);
+  clients.set(ws, { email: user_email, name: user_name });
 
   // Envia o estado inicial para o cliente recém-conectado
-  socket.emit('INITIAL_STATE', {
-    type: 'INITIAL_STATE',
-    payload: reservations.map(res => ({
-      id: res.id,
-      number: res.number,
-      user_name: res.user_name,
-      user_email: res.user_email,
-      status: res.status,
-      reserved_at: res.reserved_at,
-      ...(res.status === 'reserved' && { expires_at: res.expires_at }),
-      ...(res.status === 'purchased' && { purchased_at: res.purchased_at })
-    }))
-  });
-  console.log(`Estado inicial enviado para ${socket.id}`);
+  ws.send(JSON.stringify({ type: 'INITIAL_STATE', payload: reservations }));
+  
+  // Notifica a todos sobre a nova lista de usuários online
+  emitOnlineUsersUpdate();
 
-  // Lida com o evento TOGGLE_NUMBER_RESERVATION do cliente
-  socket.on('TOGGLE_NUMBER_RESERVATION', (data) => {
-    console.log('Evento TOGGLE_NUMBER_RESERVATION recebido:', data);
-    const { number, user_email, user_name } = data.payload;
+  // Lida com mensagens recebidas do cliente
+  ws.on('message', (message) => {
+    try {
+      const data = JSON.parse(message);
+      const { type, payload } = data;
+      const currentUser = clients.get(ws);
 
-    // Encontra a reserva existente para o número clicado
-    const existingReservation = reservations.find(res => res.number === number);
+      // Roteia a ação com base no tipo da mensagem
+      switch (type) {
+        case 'TOGGLE_NUMBER_RESERVATION':
+          console.log('Evento TOGGLE recebido:', payload);
+          const { number } = payload;
+          const existing = reservations.find(r => r.number === number);
+          if (existing) {
+            if (existing.user_email === currentUser.email) {
+              reservations = reservations.filter(r => r.number !== number);
+            }
+          } else {
+            const reserved_at = new Date();
+            reservations.push({
+              id: generateUniqueId(),
+              number,
+              user_name: currentUser.name,
+              user_email: currentUser.email,
+              status: 'reserved',
+              reserved_at: reserved_at.toISOString(),
+              expires_at: new Date(reserved_at.getTime() + 60 * 1000).toISOString()
+            });
+          }
+          emitReservationsUpdate();
+          break;
 
-    if (existingReservation) {
-      // Se o número está reservado pelo mesmo usuário, libera
-      if (existingReservation.status === 'reserved' && existingReservation.user_email === user_email) {
-        reservations = reservations.filter(res => res.number !== number);
-        console.log(`Reserva do número ${number} liberada por ${user_email}.`);
+        case 'PURCHASE_MY_RESERVATIONS':
+          console.log('Evento PURCHASE recebido:', payload);
+          reservations.forEach(res => {
+            if (res.status === 'reserved' && res.user_email === currentUser.email) {
+              res.status = 'purchased';
+              res.purchased_at = new Date().toISOString();
+              delete res.expires_at;
+            }
+          });
+          emitReservationsUpdate();
+          break;
       }
-      // Se o número está reservado por outro usuário ou já foi comprado, ignora
-      else if (existingReservation.status === 'reserved' && existingReservation.user_email !== user_email) {
-        console.log(`Número ${number} já reservado por outro usuário (${existingReservation.user_email}). Requisição ignorada.`);
-      }
-      else if (existingReservation.status === 'purchased') {
-        console.log(`Número ${number} já comprado. Requisição ignorada.`);
-      }
-    } else {
-      // Se o número está disponível, cria uma nova reserva
-      const reserved_at = new Date();
-      const expires_at = new Date(reserved_at.getTime() + 60 * 1000); // Expira em 1 minuto
-      const newReservation = {
-        id: generateUniqueId(),
-        number,
-        user_name,
-        user_email,
-        status: 'reserved',
-        reserved_at: reserved_at.toISOString(),
-        expires_at: expires_at.toISOString()
-      };
-      reservations.push(newReservation);
-      console.log(`Número ${number} reservado por ${user_email}.`);
-    }
-
-    // Após qualquer alteração, emite a atualização para todos os clientes
-    emitReservationsUpdate();
-  });
-
-  // Lida com o evento PURCHASE_MY_RESERVATIONS do cliente
-  socket.on('PURCHASE_MY_RESERVATIONS', (data) => {
-    console.log('Evento PURCHASE_MY_RESERVATIONS recebido:', data);
-    const { user_email } = data.payload;
-    let changed = false;
-
-    // Localiza e atualiza todas as reservas temporárias do usuário para 'purchased'
-    reservations = reservations.map(res => {
-      if (res.status === 'reserved' && res.user_email === user_email) {
-        changed = true;
-        return {
-          ...res,
-          status: 'purchased',
-          purchased_at: new Date().toISOString(),
-          expires_at: undefined // Remove expires_at após a compra
-        };
-      }
-      return res;
-    });
-
-    // Se alguma reserva foi alterada, emite a atualização para todos os clientes
-    if (changed) {
-      console.log(`Reservas de ${user_email} convertidas para compradas.`);
-      emitReservationsUpdate();
-    } else {
-      console.log(`Nenhuma reserva encontrada para compra para ${user_email}.`);
+    } catch (e) {
+      console.error('Erro ao processar mensagem:', e);
     }
   });
 
-  // Lida com a desconexão do cliente
-  socket.on('disconnect', () => {
-    console.log(`Cliente desconectado: ${socket.id}`);
+  // Lida com a desconexão
+  ws.on('close', () => {
+    console.log(`Cliente desconectado: ${user_name} (${user_email})`);
+    clients.delete(ws);
+    emitOnlineUsersUpdate();
+  });
+
+  ws.on('error', (error) => {
+    console.error('Erro no WebSocket:', error);
   });
 });
 
-// Define a porta do servidor
-const PORT = process.env.PORT || 3000;
-
-// Inicia o servidor HTTP
+const PORT = process.env.PORT || 3333;
 server.listen(PORT, () => {
   console.log(`Servidor rodando na porta ${PORT}`);
-  console.log('Aguardando conexões WebSocket...');
-});
-
-// Rota básica para verificar se o servidor está funcionando
-app.get('/', (req, res) => {
-  res.send('Servidor de Reserva de Números está ativo!');
 });
