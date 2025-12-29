@@ -137,7 +137,7 @@ wss.on('connection', (ws, req) => {
   });
 });
 
-const PORT = process.env.PORT || 3333;
+const PORT = process.env.PORT || 3335;
 server.listen(PORT, () => {
   console.log(`Servidor rodando na porta ${PORT}`);
 });
