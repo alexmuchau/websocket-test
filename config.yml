@@ -1,0 +1,7 @@
+tunnel: 3fdece61-6c91-4399-b90b-1c63dfff2214
+credentials-file: /home/alekkdev/.cloudflared/3fdece61-6c91-4399-b90b-1c63dfff2214.json
+
+ingress:
+  - hostname: ws-test.muchau.com.br
+    service: http://localhost:3335
+  - service: http_status:404

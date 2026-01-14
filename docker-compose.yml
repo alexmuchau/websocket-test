@@ -3,13 +3,13 @@ services:
     build: .
     container_name: websocket-test-server
     ports:
-      - "4000:3333"
+      - "3335:3335"
     environment:
       - NODE_ENV=production
-      - PORT=3333
+      - PORT=3335
     restart: unless-stopped
     healthcheck:
-      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:3333/"]
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:3335/"]
       interval: 30s
       timeout: 10s
       retries: 3
